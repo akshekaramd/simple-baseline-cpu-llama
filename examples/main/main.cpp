@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include <chrono> 	// AK - Addition
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
 #include <unistd.h>
@@ -555,6 +557,7 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    auto start = std::chrono::high_resolution_clock::now();
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -973,6 +976,8 @@ int main(int argc, char ** argv) {
             is_interacting = true;
         }
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto execution_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG_TEE("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
@@ -980,6 +985,8 @@ int main(int argc, char ** argv) {
     }
 
     llama_print_timings(ctx);
+
+    std::cout << "AK - main.cpp - Token Generation time: " << execution_time.count() << " milliseconds" << std::endl;
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
 
     if (ctx_guidance) { llama_free(ctx_guidance); }
