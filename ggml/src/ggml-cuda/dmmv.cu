@@ -1,6 +1,7 @@
 #include "dmmv.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include <chrono>
 
 #ifndef K_QUANTS_PER_ITERATION
 #define K_QUANTS_PER_ITERATION 2
@@ -587,13 +588,29 @@ static void dequantize_mul_mat_vec_q6_K_cuda(const void * vx, const float * y, f
     dequantize_mul_mat_vec_q6_k<<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
 }
 
-static void convert_mul_mat_vec_f16_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
-    GGML_ASSERT(ncols % (GGML_CUDA_DMMV_X*2) == 0);
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, 1, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    dequantize_mul_mat_vec<GGML_TYPE_F16>
-        <<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
+static void convert_mul_mat_vec_f16_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, cudaStream_t stream, bool offload_to_pim) {
+    cudaDeviceSynchronize();
+    if(offload_to_pim == false) {
+        GGML_ASSERT(ncols % (GGML_CUDA_DMMV_X*2) == 0);
+        const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+        const dim3 block_nums(block_num_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+        dequantize_mul_mat_vec<GGML_TYPE_F16>
+            <<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
+        cudaDeviceSynchronize();
+    } else {
+        auto start = std::chrono::high_resolution_clock::now();
+        GGML_ASSERT(ncols % (GGML_CUDA_DMMV_X*2) == 0);
+        const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+        const dim3 block_nums(block_num_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+        dequantize_mul_mat_vec<GGML_TYPE_F16>
+            <<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
+        cudaDeviceSynchronize();
+        auto end = std::chrono::high_resolution_clock::now();
+        auto execution_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        std::cout << "AK - dmmv.cu - GPU GEMV Matmul Time = " << execution_time.count() << " milliseconds" << std::endl;
+    }
 }
 
 void ggml_cuda_op_dequantize_mul_mat_vec(
@@ -659,8 +676,33 @@ void ggml_cuda_op_dequantize_mul_mat_vec(
             dequantize_mul_mat_vec_q6_K_cuda(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_F16:
-            convert_mul_mat_vec_f16_cuda(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+        {
+
+            // Linear Transformation related to QKV vectors and the 2 used in Feed Forward Networks
+            // are to be offloaded unto PIM
+            // This leaves us with two GEMV ops that shouldnt be offloaded unto PIM which are
+            // ffn_gate --> This is a gating function used to selectively suppress and amplify certain 
+            //              signals of a by multiplying the input with a gating vector
+            // token_embd --> Used to convert the embeddings into a token  
+            std::string tensor_name = ggml_get_name(src0);
+            bool offload_to_pim = false;
+
+            if (    (tensor_name.find("ffn_down") != std::string::npos) ||
+                    (tensor_name.find("ffn_up") != std::string::npos) ||
+                    (tensor_name.find("attn_q") != std::string::npos) ||
+                    (tensor_name.find("attn_k") != std::string::npos) ||
+                    (tensor_name.find("attn_v") != std::string::npos) ||
+                    (tensor_name.find("attn_output") != std::string::npos)) {
+                offload_to_pim = true;
+            } else {
+                // std::cout << "Encountered an op that shouldnt be offloaded - src0-op_name = "
+                //            << ggml_get_name(src0) << "\n";
+                offload_to_pim = false;
+            }
+            convert_mul_mat_vec_f16_cuda(src0_dd_i, 
+                src1_dfloat, dst_dd_i, ne00, row_diff, stream, offload_to_pim);
             break;
+        }
         default:
             GGML_ABORT("fatal error");
             break;
